@@ -4,40 +4,40 @@ import requests
 from steampy import guard
 import rsa
 
-from steampy.exceptions import InvalidCredentials, CaptchaRequired
+from .exceptions import InvalidCredentials, CaptchaRequired
+from .constants import COMMUNITY_URL, STORE_URL
 
 
 class LoginExecutor:
-    COMMUNITY_URL = "https://steamcommunity.com"
-    STORE_URL = 'https://store.steampowered.com'
-
     def __init__(self, username: str, password: str, shared_secret: str, session: requests.Session) -> None:
         self.username = username
         self.password = password
-        self.one_time_code = ''
+        self.one_time_code = ""
         self.shared_secret = shared_secret
         self.session = session
 
-    def login(self) -> requests.Session:
+    def login(self) -> dict:
+        self.one_time_code = ""
         login_response = self._send_login_request()
         self._check_for_captcha(login_response)
         login_response = self._enter_steam_guard_if_necessary(login_response)
+        json_login_response = login_response.json()
         self._assert_valid_credentials(login_response)
-        self._perform_redirects(login_response.json())
+        self._perform_redirects(json_login_response)
         self.set_sessionid_cookies()
-        return self.session
+        return {"steamid": json_login_response["transfer_parameters"]["steamid"]}
 
     def _send_login_request(self) -> requests.Response:
         rsa_params = self._fetch_rsa_params()
         encrypted_password = self._encrypt_password(rsa_params)
         rsa_timestamp = rsa_params['rsa_timestamp']
         request_data = self._prepare_login_request_data(encrypted_password, rsa_timestamp)
-        return self.session.post(self.STORE_URL + '/login/dologin', data=request_data)
+        return self.session.post(STORE_URL + '/login/dologin', data=request_data)
 
     def set_sessionid_cookies(self):
         sessionid = self.session.cookies.get_dict()['sessionid']
-        community_domain = self.COMMUNITY_URL[8:]
-        store_domain = self.STORE_URL[8:]
+        community_domain = COMMUNITY_URL[8:]
+        store_domain = STORE_URL[8:]
         community_cookie = self._create_session_id_cookie(sessionid, community_domain)
         store_cookie = self._create_session_id_cookie(sessionid, store_domain)
         self.session.cookies.set(**community_cookie)
@@ -51,7 +51,7 @@ class LoginExecutor:
 
     def _fetch_rsa_params(self, current_number_of_repetitions: int = 0) -> dict:
         maximal_number_of_repetitions = 5
-        key_response = self.session.post(self.STORE_URL + '/login/getrsakey/',
+        key_response = self.session.post(STORE_URL + '/login/getrsakey/',
                                          data={'username': self.username}).json()
         try:
             rsa_mod = int(key_response['publickey_mod'], 16)
@@ -107,4 +107,4 @@ class LoginExecutor:
             self.session.post(url, parameters)
 
     def _fetch_home_page(self, session: requests.Session) -> requests.Response:
-        return session.post(self.COMMUNITY_URL + '/my/home/')
+        return session.post(COMMUNITY_URL + '/my/home/')

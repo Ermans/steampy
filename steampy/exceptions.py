@@ -1,26 +1,43 @@
-class SevenDaysHoldException(Exception):
+class SteampyException(Exception):
+    """All the exception of this library should extend this."""
     pass
 
 
-class TooManyRequests(Exception):
+class TradeHoldException(SteampyException):
     pass
 
 
-class ApiException(Exception):
+class TooManyRequests(SteampyException):
     pass
 
 
-class LoginRequired(Exception):
+class ApiException(SteampyException):
     pass
 
 
-class InvalidCredentials(Exception):
+class LoginRequired(SteampyException):
     pass
 
 
-class CaptchaRequired(Exception):
+class CaptchaRequired(SteampyException):
     pass
 
 
-class ConfirmationExpected(Exception):
+class ConfirmationExpected(SteampyException):
+    pass
+
+
+class LoginException(SteampyException):
+    pass
+
+
+class InvalidCredentials(LoginException):
+    pass
+
+
+class SteamServerError(SteampyException):
+    pass
+
+
+class ParameterError(SteampyException, ValueError):
     pass

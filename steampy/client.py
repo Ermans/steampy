@@ -1,145 +1,207 @@
-import urllib.parse as urlparse
+import json
 from typing import List
 
-import json
-import requests
-from steampy import guard
-from steampy.confirmation import ConfirmationExecutor
-from steampy.exceptions import SevenDaysHoldException, LoginRequired, ApiException
-from steampy.login import LoginExecutor, InvalidCredentials
-from steampy.market import SteamMarket
-from steampy.models import Asset, TradeOfferState, SteamUrl, GameOptions
-from steampy.utils import text_between, texts_between, merge_items_with_descriptions_from_inventory, \
-    steam_id_to_account_id, merge_items_with_descriptions_from_offers, get_description_key, \
-    merge_items_with_descriptions_from_offer, account_id_to_steam_id, get_key_value_from_url
+import pickle
 
+import os.path
 
-def login_required(func):
-    def func_wrapper(self, *args, **kwargs):
-        if not self.was_login_executed:
-            raise LoginRequired('Use login method first')
-        else:
-            return func(self, *args, **kwargs)
-
-    return func_wrapper
+from .market import SteamMarket
+from .session import SteamSession, login_required
+from .confirmation import ConfirmationExecutor
+from .exceptions import SteamServerError, ParameterError, TradeHoldException
+from .constants import COMMUNITY_URL, STORE_URL
+from .utils import get_partner_from_trade_offer_url, get_token_from_trade_offer_url, account_id_to_steam_id, \
+    steam_id_to_account_id, texts_between, handle_steam_response, extract_json
+from .models import GameOptions, Asset
 
 
 class SteamClient:
-    def __init__(self, api_key: str) -> None:
-        self._api_key = api_key
-        self._session = requests.Session()
-        self.steam_guard = None
-        self.was_login_executed = False
-        self.username = None
-        self.market = SteamMarket(self._session)
+    def __init__(self, api_key: str = None) -> None:
+        super().__init__()
+        self.steam_session = SteamSession()
+        self.market = SteamMarket(self.steam_session)
+
+        if api_key:
+            self.api_key = api_key
+
+    @property
+    def api_key(self) -> str:
+        return self.steam_session.api_key
+
+    @api_key.setter
+    def api_key(self, api_key: str):
+        self.steam_session.api_key = api_key
 
     def login(self, username: str, password: str, steam_guard: str) -> None:
-        self.steam_guard = guard.load_steam_guard(steam_guard)
-        self.username = username
-        LoginExecutor(username, password, self.steam_guard['shared_secret'], self._session).login()
-        self.was_login_executed = True
-        self.market._set_login_executed(self.steam_guard, self._get_session_id())
+        self.steam_session.login(username, password, steam_guard)
 
-    @login_required
+    def relogin(self):
+        self.steam_session.relogin()
+
     def logout(self) -> None:
-        url = LoginExecutor.STORE_URL + '/logout/'
-        params = {'sessionid': self._get_session_id()}
-        self._session.post(url, params)
-        if self.is_session_alive():
-            raise Exception("Logout unsuccessful")
-        self.was_login_executed = False
+        raise NotImplementedError
+
+    def is_session_alive(self) -> bool:
+        """ Check if you are still logged in on Steam """
+        url = STORE_URL + "/account/store_transactions/"
+        head_response = self.steam_session.head(url)
+        return head_response.status_code == 200
+
+    def get_player_inventory(self, player_steam_id: str, game: GameOptions, count=0) -> dict:
+        """ Return the inventory of the player by steam_id. 'count' can go up to 5000."""
+        url = "%s/inventory/%s/%s/%s/?l=english" % (COMMUNITY_URL, player_steam_id, game.app_id, game.context_id)
+        if count:
+            url = url + "&count=%s" % count
+
+        response = self.steam_session.get(url)
+        handle_steam_response(response)
+        response_json = extract_json(response)
+        return response_json
 
     @login_required
-    def is_session_alive(self):
-        steam_login = self.username
-        main_page_response = self._session.get(SteamUrl.COMMUNITY_URL)
-        return steam_login.lower() in main_page_response.text.lower()
+    def get_my_inventory(self, game: GameOptions, count=0) -> dict:
+        """
+        Return your inventory. 'count' can go up to 5000.
+        This method is intended to be shorter than 'get_player_inventory(...)' but, to know who you are, login is
+        required.
+        """
+        return self.get_player_inventory(self.steam_session.steam_id, game, count)
 
-    def api_call(self, request_method: str, interface: str, api_method: str, version: str,
-                 params: dict = None) -> requests.Response:
-        url = '/'.join([SteamUrl.API_URL, interface, api_method, version])
-        if request_method == 'GET':
-            response = requests.get(url, params=params)
+    @login_required
+    def send_trade_offer(self,
+                         items_to_give: List[Asset],
+                         items_to_receive: List[Asset],
+                         message: str = None,
+                         partner_steam_id: str = None,
+                         trade_offer_url: str = None,
+                         check_trade_hold=True) -> dict:
+        """
+        Send a Steam trade offer.
+        If the partner is your Steam friend, you need to pass his steam_id.
+        If the partner is not your friend on Steam, you need to pass his trade_offer_url.
+        'message' can be omitted.
+        If 'check_trade_hold' is set to True the offer will not be sent if the items will be put on hold after the trade
+        """
+        token = None
+        trade_offer_create_params = {}
+        if trade_offer_url:
+            token = get_token_from_trade_offer_url(trade_offer_url)
+            partner_account_id = get_partner_from_trade_offer_url(trade_offer_url)
+            partner_steam_id = account_id_to_steam_id(partner_account_id)
+            trade_offer_create_params["trade_offer_access_token"] = token
+            referer = trade_offer_url
+
+        elif partner_steam_id:
+            partner_account_id = steam_id_to_account_id(partner_steam_id)
+            referer = COMMUNITY_URL + '/tradeoffer/new/?partner=' + partner_account_id
+
         else:
-            response = requests.post(url, data=params)
-        if self.is_invalid_api_key(response):
-            raise InvalidCredentials('Invalid API key')
-        return response
+            raise ParameterError("A 'trade_offer_url' or a 'partner_steam_id' is needed to use this method")
 
-    @staticmethod
-    def is_invalid_api_key(response: requests.Response) -> bool:
-        msg = 'Access is denied. Retrying will not help. Please verify your <pre>key=</pre> parameter'
-        return msg in response.text
+        if check_trade_hold:
+            json_response = self.get_trade_hold_durations(partner_steam_id, token)
+            trade_hold_duration = json_response["response"]["both_escrow"]["escrow_end_duration_seconds"]
+            if trade_hold_duration != 0:
+                raise TradeHoldException("Offer not sent because items will be on hold")
+
+        offer = self._create_offer_dict(items_to_give, items_to_receive)
+        params = {
+            'sessionid': self._get_session_id(),
+            'serverid': 1,
+            'partner': partner_steam_id,
+            'tradeoffermessage': message,
+            'json_tradeoffer': json.dumps(offer),
+            'captcha': '',
+            'trade_offer_create_params': json.dumps(trade_offer_create_params)
+        }
+        headers = {'Referer': referer, 'Origin': COMMUNITY_URL}
+
+        response = self.steam_session.post(COMMUNITY_URL + '/tradeoffer/new/send', data=params, headers=headers)
+        handle_steam_response(response)
+        response_json = extract_json(response)
+
+        if response_json.get('needs_mobile_confirmation'):
+            if "tradeofferid" not in response_json:
+                raise SteamServerError("Steam responded without a 'tradeofferid'")
+
+            confirmation_response_dict = self._confirm_trade_offer(response_json['tradeofferid'])
+            response_json.update(confirmation_response_dict)
+        return response_json
 
     @login_required
-    def get_my_inventory(self, game: GameOptions, merge: bool = True) -> dict:
-        url = SteamUrl.COMMUNITY_URL + '/my/inventory/json/' + \
-              game.app_id + '/' + \
-              game.context_id
-        response_dict = self._session.get(url).json()
-        if merge:
-            return merge_items_with_descriptions_from_inventory(response_dict, game)
-        return response_dict
+    def accept_trade_offer(self, trade_offer_id: str, partner_steam_id: str = None, check_trade_hold=True) -> dict:
+        """
+        Accept a trade offer.
+        You can make this method faster (one less request to steam endpoint) if you provide 'partner_steam_id' and set
+        'check_trade_hold' to False.
+        Do that only if you already know that no trade hold will be issued when accepting this offer.
+        This is useful when you fetch a trade offer from 'get_trade_offers(...)' or 'get_trade_offer(...)' so you
+        already have all the required information.
+        """
+        if check_trade_hold or not partner_steam_id:
+            offer = self.get_trade_offer(trade_offer_id)["response"]["offer"]
 
-    @login_required
-    def get_partner_inventory(self, partner_steam_id: str, game: GameOptions, merge: bool = True) -> dict:
+            if check_trade_hold and offer["escrow_end_date"] != 0:
+                raise TradeHoldException("Offer not accepted because items will be put on hold")
+
+            if not partner_steam_id:
+                partner_steam_id = offer["accountid_other"]
+
+        partner_steam_id = account_id_to_steam_id(partner_steam_id)
+        accept_url = COMMUNITY_URL + '/tradeoffer/' + trade_offer_id + '/accept'
         params = {'sessionid': self._get_session_id(),
+                  'tradeofferid': trade_offer_id,
+                  'serverid': '1',
                   'partner': partner_steam_id,
-                  'appid': int(game.app_id),
-                  'contextid': game.context_id}
-        partner_account_id = steam_id_to_account_id(partner_steam_id)
-        headers = {'X-Requested-With': 'XMLHttpRequest',
-                   'Referer': SteamUrl.COMMUNITY_URL + '/tradeoffer/new/?partner=' + partner_account_id,
-                   'X-Prototype-Version': '1.7'}
-        response_dict = self._session.get(SteamUrl.COMMUNITY_URL + '/tradeoffer/new/partnerinventory/',
-                                          params=params,
-                                          headers=headers).json()
-        if merge:
-            return merge_items_with_descriptions_from_inventory(response_dict, game)
-        return response_dict
+                  'captcha': ''}
+        headers = {'Referer': COMMUNITY_URL + '/tradeoffer/' + trade_offer_id}
+        # todo check what goes wrong if the offer is no longer active
+        response = self.steam_session.post(accept_url, data=params, headers=headers)
 
-    def _get_session_id(self) -> str:
-        return self._session.cookies.get_dict()['sessionid']
+        handle_steam_response(response)
+        response_json = extract_json(response)
+
+        if response_json.get('needs_mobile_confirmation', False):
+            return self._confirm_trade_offer(trade_offer_id)
+        return response_json
+
+    def decline_trade_offer(self, trade_offer_id: str) -> dict:
+        params = {'tradeofferid': trade_offer_id}
+        response_json = self.steam_session.api_call('POST', 'IEconService', 'DeclineTradeOffer', 'v1', params)
+        return response_json
+
+    def cancel_trade_offer(self, trade_offer_id: str) -> dict:
+        params = {'tradeofferid': trade_offer_id}
+        response_json = self.steam_session.api_call('POST', 'IEconService', 'CancelTradeOffer', 'v1', params)
+        return response_json
+
+    def get_trade_offers(self,
+                         get_sent_offers=True,
+                         get_received_offers=True,
+                         get_descriptions=True,
+                         active_only=True,
+                         historical_only=False,
+                         time_historical_cutoff="",
+                         language="english") -> dict:
+
+        params = {'get_sent_offers': 1 if get_sent_offers else 0,
+                  "get_received_offers": 1 if get_received_offers else 0,
+                  "get_descriptions": 1 if get_descriptions else 0,
+                  "language": language,
+                  'active_only': 1 if active_only else 0,
+                  'historical_only': 0 if historical_only else 0,
+                  'time_historical_cutoff': time_historical_cutoff}
+        response_json = self.steam_session.api_call('GET', 'IEconService', 'GetTradeOffers', 'v1', params)
+        return response_json
+
+    def get_trade_offer(self, trade_offer_id: str) -> dict:
+        params = {'tradeofferid': trade_offer_id, 'language': 'english'}
+        response_json = self.steam_session.api_call('GET', 'IEconService', 'GetTradeOffer', 'v1', params)
+        return response_json
 
     def get_trade_offers_summary(self) -> dict:
-        params = {'key': self._api_key}
-        return self.api_call('GET', 'IEconService', 'GetTradeOffersSummary', 'v1', params).json()
-
-    def get_trade_offers(self, merge: bool = True) -> dict:
-        params = {'key': self._api_key,
-                  'get_sent_offers': 1,
-                  'get_received_offers': 1,
-                  'get_descriptions': 1,
-                  'language': 'english',
-                  'active_only': 1,
-                  'historical_only': 0,
-                  'time_historical_cutoff': ''}
-        response = self.api_call('GET', 'IEconService', 'GetTradeOffers', 'v1', params).json()
-        response = self._filter_non_active_offers(response)
-        if merge:
-            response = merge_items_with_descriptions_from_offers(response)
-        return response
-
-    @staticmethod
-    def _filter_non_active_offers(offers_response):
-        offers_received = offers_response['response'].get('trade_offers_received', [])
-        offers_sent = offers_response['response'].get('trade_offers_sent', [])
-        offers_response['response']['trade_offers_received'] = list(
-            filter(lambda offer: offer['trade_offer_state'] == TradeOfferState.Active, offers_received))
-        offers_response['response']['trade_offers_sent'] = list(
-            filter(lambda offer: offer['trade_offer_state'] == TradeOfferState.Active, offers_sent))
-        return offers_response
-
-    def get_trade_offer(self, trade_offer_id: str, merge: bool = True) -> dict:
-        params = {'key': self._api_key,
-                  'tradeofferid': trade_offer_id,
-                  'language': 'english'}
-        response = self.api_call('GET', 'IEconService', 'GetTradeOffer', 'v1', params).json()
-        if merge and "descriptions" in response['response']:
-            descriptions = {get_description_key(offer): offer for offer in response['response']['descriptions']}
-            offer = response['response']['offer']
-            response['response']['offer'] = merge_items_with_descriptions_from_offer(offer, descriptions)
-        return response
+        response_json = self.steam_session.api_call('GET', 'IEconService', 'GetTradeOffersSummary', 'v1')
+        return response_json
 
     def get_trade_history(self,
                           max_trades=100,
@@ -150,7 +212,6 @@ class SteamClient:
                           include_failed=True,
                           include_total=True) -> dict:
         params = {
-            'key': self._api_key,
             'max_trades': max_trades,
             'start_after_time': start_after_time,
             'start_after_tradeid': start_after_tradeid,
@@ -159,142 +220,51 @@ class SteamClient:
             'include_failed': include_failed,
             'include_total': include_total
         }
-        response = self.api_call('GET', 'IEconService', 'GetTradeHistory', 'v1', params).json()
-        return response
+        response_json = self.steam_session.api_call('GET', 'IEconService', 'GetTradeHistory', 'v1', params)
+        return response_json
 
     def get_trade_receipt(self, trade_id: str) -> list:
-        html = self._session.get("https://steamcommunity.com/trade/{}/receipt".format(trade_id)).content.decode()
+        url = COMMUNITY_URL + "/trade/" + trade_id + "/receipt"
+        html = self.steam_session.get(url).text
         items = []
         for item in texts_between(html, "oItem = ", ";\r\n\toItem"):
             items.append(json.loads(item))
         return items
 
-    @login_required
-    def accept_trade_offer(self, trade_offer_id: str) -> dict:
-        trade = self.get_trade_offer(trade_offer_id)
-        trade_offer_state = TradeOfferState(trade['response']['offer']['trade_offer_state'])
-        if trade_offer_state is not TradeOfferState.Active:
-            raise ApiException("Invalid trade offer state: {} ({})".format(trade_offer_state.name,
-                                                                           trade_offer_state.value))
-        partner = self._fetch_trade_partner_id(trade_offer_id)
-        session_id = self._get_session_id()
-        accept_url = SteamUrl.COMMUNITY_URL + '/tradeoffer/' + trade_offer_id + '/accept'
-        params = {'sessionid': session_id,
-                  'tradeofferid': trade_offer_id,
-                  'serverid': '1',
-                  'partner': partner,
-                  'captcha': ''}
-        headers = {'Referer': self._get_trade_offer_url(trade_offer_id)}
-        response = self._session.post(accept_url, data=params, headers=headers).json()
-        if response.get('needs_mobile_confirmation', False):
-            return self._confirm_transaction(trade_offer_id)
-        return response
+    def get_trade_hold_durations(self, player_steam_id, trade_offer_access_token: str = None) -> dict:
+        """
+        'trade_offer_access_token' can be found in the trade offer url of that player.
+        If the player is your friend on Steam no token is required.
+        """
+        params = {"steamid_target": player_steam_id, "trade_offer_access_token": trade_offer_access_token}
+        response_json = self.steam_session.api_call("GET", "IEconService", "GetTradeHoldDurations", "v1", params)
+        return response_json
 
-    def _fetch_trade_partner_id(self, trade_offer_id: str) -> str:
-        url = self._get_trade_offer_url(trade_offer_id)
-        offer_response_text = self._session.get(url).text
-        if 'You have logged in from a new device. In order to protect the items' in offer_response_text:
-            raise SevenDaysHoldException("Account has logged in a new device and can't trade for 7 days")
-        return text_between(offer_response_text, "var g_ulTradePartnerSteamID = '", "';")
-
-    def _confirm_transaction(self, trade_offer_id: str) -> dict:
-        confirmation_executor = ConfirmationExecutor(self.steam_guard['identity_secret'], self.steam_guard['steamid'],
-                                                     self._session)
-        return confirmation_executor.send_trade_allow_request(trade_offer_id)
-
-    def decline_trade_offer(self, trade_offer_id: str) -> dict:
-        params = {'key': self._api_key,
-                  'tradeofferid': trade_offer_id}
-        return self.api_call('POST', 'IEconService', 'DeclineTradeOffer', 'v1', params).json()
-
-    def cancel_trade_offer(self, trade_offer_id: str) -> dict:
-        params = {'key': self._api_key,
-                  'tradeofferid': trade_offer_id}
-        return self.api_call('POST', 'IEconService', 'CancelTradeOffer', 'v1', params).json()
-
-    @login_required
-    def make_offer(self, items_from_me: List[Asset], items_from_them: List[Asset], partner_steam_id: str,
-                   message: str = '') -> dict:
-        offer = self._create_offer_dict(items_from_me, items_from_them)
-        session_id = self._get_session_id()
-        url = SteamUrl.COMMUNITY_URL + '/tradeoffer/new/send'
-        server_id = 1
-        params = {
-            'sessionid': session_id,
-            'serverid': server_id,
-            'partner': partner_steam_id,
-            'tradeoffermessage': message,
-            'json_tradeoffer': json.dumps(offer),
-            'captcha': '',
-            'trade_offer_create_params': '{}'
-        }
-        partner_account_id = steam_id_to_account_id(partner_steam_id)
-        headers = {'Referer': SteamUrl.COMMUNITY_URL + '/tradeoffer/new/?partner=' + partner_account_id,
-                   'Origin': SteamUrl.COMMUNITY_URL}
-        response = self._session.post(url, data=params, headers=headers).json()
-        if response.get('needs_mobile_confirmation'):
-            response.update(self._confirm_transaction(response['tradeofferid']))
-        return response
-
-    def get_profile(self, steam_id: str) -> dict:
-        params = {'steamids': steam_id, 'key': self._api_key}
-        response = self.api_call('GET', 'ISteamUser', 'GetPlayerSummaries', 'v0002', params)
-        data = response.json()
-        return data['response']['players'][0]
+    def _get_session_id(self) -> str:
+        return self.steam_session.cookies.get_dict()['sessionid']
 
     @staticmethod
-    def _create_offer_dict(items_from_me: List[Asset], items_from_them: List[Asset]) -> dict:
+    def _create_offer_dict(items_to_give: List[Asset], items_to_receive: List[Asset]) -> dict:
         return {
             'newversion': True,
             'version': 4,
             'me': {
-                'assets': [asset.to_dict() for asset in items_from_me],
+                'assets': [asset.to_dict() for asset in items_to_give],
                 'currency': [],
                 'ready': False
             },
             'them': {
-                'assets': [asset.to_dict() for asset in items_from_them],
+                'assets': [asset.to_dict() for asset in items_to_receive],
                 'currency': [],
                 'ready': False
             }
         }
 
-    @login_required
-    def get_escrow_duration(self, trade_offer_url: str) -> int:
-        headers = {'Referer': SteamUrl.COMMUNITY_URL + urlparse.urlparse(trade_offer_url).path,
-                   'Origin': SteamUrl.COMMUNITY_URL}
-        response = self._session.get(trade_offer_url, headers=headers).text
-        my_escrow_duration = int(text_between(response, "var g_daysMyEscrow = ", ";"))
-        their_escrow_duration = int(text_between(response, "var g_daysTheirEscrow = ", ";"))
-        return max(my_escrow_duration, their_escrow_duration)
-
-    @login_required
-    def make_offer_with_url(self, items_from_me: List[Asset], items_from_them: List[Asset],
-                            trade_offer_url: str, message: str = '') -> dict:
-        token = get_key_value_from_url(trade_offer_url, 'token')
-        partner_account_id = get_key_value_from_url(trade_offer_url, 'partner')
-        partner_steam_id = account_id_to_steam_id(partner_account_id)
-        offer = self._create_offer_dict(items_from_me, items_from_them)
-        session_id = self._get_session_id()
-        url = SteamUrl.COMMUNITY_URL + '/tradeoffer/new/send'
-        server_id = 1
-        trade_offer_create_params = {'trade_offer_access_token': token}
-        params = {
-            'sessionid': session_id,
-            'serverid': server_id,
-            'partner': partner_steam_id,
-            'tradeoffermessage': message,
-            'json_tradeoffer': json.dumps(offer),
-            'captcha': '',
-            'trade_offer_create_params': json.dumps(trade_offer_create_params)
-        }
-        headers = {'Referer': SteamUrl.COMMUNITY_URL + urlparse.urlparse(trade_offer_url).path,
-                   'Origin': SteamUrl.COMMUNITY_URL}
-        response = self._session.post(url, data=params, headers=headers).json()
-        if response.get('needs_mobile_confirmation'):
-            response.update(self._confirm_transaction(response['tradeofferid']))
-        return response
-
-    @staticmethod
-    def _get_trade_offer_url(trade_offer_id: str) -> str:
-        return SteamUrl.COMMUNITY_URL + '/tradeoffer/' + trade_offer_id
+    def _confirm_trade_offer(self, trade_offer_id: str) -> dict:
+        conf_executor = ConfirmationExecutor(self.steam_session.steam_guard['identity_secret'],
+                                             self.steam_session.steam_id,
+                                             self.steam_session)
+        try:
+            return conf_executor.confirm_trade_offer(trade_offer_id)
+        except Exception as e:
+            raise SteamServerError("[CONFIRM_TRADE_OFFER_ERROR]") from e

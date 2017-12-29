@@ -1,4 +1,3 @@
-import enum
 import json
 import time
 from typing import List
@@ -6,9 +5,9 @@ from typing import List
 import requests
 from bs4 import BeautifulSoup
 
-from steampy import guard
-from steampy.exceptions import ConfirmationExpected
-from steampy.login import InvalidCredentials
+from .guard import generate_device_id, generate_confirmation_key
+from .exceptions import ConfirmationExpected
+from .login import InvalidCredentials
 
 
 class Confirmation:
@@ -18,7 +17,7 @@ class Confirmation:
         self.data_key = data_key
 
 
-class Tag(enum.Enum):
+class Tag:
     CONF = 'conf'
     DETAILS = 'details'
     ALLOW = 'allow'
@@ -33,7 +32,7 @@ class ConfirmationExecutor:
         self._identity_secret = identity_secret
         self._session = session
 
-    def send_trade_allow_request(self, trade_offer_id: str) -> dict:
+    def confirm_trade_offer(self, trade_offer_id: str) -> dict:
         confirmations = self._get_confirmations()
         confirmation = self._select_trade_offer_confirmation(confirmations, trade_offer_id)
         return self._send_confirmation(confirmation)
@@ -44,9 +43,8 @@ class ConfirmationExecutor:
         return self._send_confirmation(confirmation)
 
     def _send_confirmation(self, confirmation: Confirmation) -> dict:
-        tag = Tag.ALLOW
-        params = self._create_confirmation_params(tag.value)
-        params['op'] = tag.value,
+        params = self._create_confirmation_params(Tag.ALLOW)
+        params['op'] = Tag.ALLOW,
         params['cid'] = confirmation.data_confid
         params['ck'] = confirmation.data_key
         headers = {'X-Requested-With': 'XMLHttpRequest'}
@@ -66,8 +64,7 @@ class ConfirmationExecutor:
         return confirmations
 
     def _fetch_confirmations_page(self) -> requests.Response:
-        tag = Tag.CONF.value
-        params = self._create_confirmation_params(tag)
+        params = self._create_confirmation_params(Tag.CONF)
         headers = {'X-Requested-With': 'com.valvesoftware.android.steam.community'}
         response = self._session.get(self.CONF_URL + '/conf', params=params, headers=headers)
         if 'Steam Guard Mobile Authenticator is providing incorrect Steam Guard codes.' in response.text:
@@ -82,8 +79,8 @@ class ConfirmationExecutor:
 
     def _create_confirmation_params(self, tag_string: str) -> dict:
         timestamp = int(time.time())
-        confirmation_key = guard.generate_confirmation_key(self._identity_secret, tag_string, timestamp)
-        android_id = guard.generate_device_id(self._my_steam_id)
+        confirmation_key = generate_confirmation_key(self._identity_secret, tag_string, timestamp)
+        android_id = generate_device_id(self._my_steam_id)
         return {'p': android_id,
                 'a': self._my_steam_id,
                 'k': confirmation_key,
